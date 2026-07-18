@@ -1,0 +1,912 @@
+"""
+LA Crime Data Analysis — Annotated Version
+============================================
+This script loads LAPD crime data, cleans it, explores temporal/demographic
+patterns, builds a classifier to predict victim descent, runs several
+clustering experiments, maps results with folium, and mines association
+rules between crime attributes.
+
+Every step below has a comment explaining WHAT it does and WHY, so someone
+replicating this pipeline on their own data/machine can follow along.
+"""
+
+# ---------------------------------------------------------------------------
+# 1. IMPORTS
+# ---------------------------------------------------------------------------
+import pandas as pd                 # tabular data handling (DataFrames)
+import numpy as np                  # numerical operations, NaN handling
+import matplotlib.pyplot as plt     # static plotting
+import seaborn as sns                # nicer statistical plots (used for heatmap)
+import warnings                      # to suppress noisy library warnings
+
+# Install mlxtend (not part of default sklearn/pandas stack) — needed for
+# association rule mining (apriori algorithm) later in the script.
+!pip install mlxtend
+
+from sklearn.model_selection import train_test_split          # split data into train/test sets
+from sklearn.preprocessing import OneHotEncoder, StandardScaler  # encode categories / scale numbers
+from sklearn.compose import ColumnTransformer                  # apply different preprocessing to different columns
+from sklearn.metrics import classification_report, confusion_matrix  # evaluate classifier performance
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier  # classifier models (only RandomForest is actually used below)
+from sklearn.cluster import KMeans   # clustering algorithm
+
+# mlxtend's apriori/association_rules implement market-basket-style
+# "if X happens, Y tends to happen too" rule mining.
+from mlxtend.frequent_patterns import apriori, association_rules
+
+from imblearn.pipeline import Pipeline as ImbPipeline   # like sklearn Pipeline, but supports resampling steps (e.g. SMOTE)
+from imblearn.over_sampling import SMOTE                # generates synthetic samples for minority classes to fix class imbalance
+
+# Hide warning messages (e.g. deprecation warnings) so notebook output stays clean.
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# 2. LOAD DATA
+# ---------------------------------------------------------------------------
+# Path to the raw CSV file — update this to wherever your file lives.
+path = "Crime_Data_from_2020_to_Present.csv"
+
+# Load only the first 100,000 rows (the full file is much larger) to keep
+# memory usage and runtime manageable while prototyping.
+df = pd.read_csv(path, low_memory=False, nrows=100000)
+
+# NOTE: this second read is redundant (df already loaded above) — it just
+# reloads the same 100k rows again. Safe to delete in a cleaned-up version.
+df = pd.read_csv(path, low_memory=False, nrows=100000)
+df.head()  # quick visual sanity check of the first 5 rows
+
+# ---------------------------------------------------------------------------
+# 3. DROP UNUSED COLUMNS
+# ---------------------------------------------------------------------------
+# These columns are IDs, free-text, or redundant fields not needed for the
+# analysis (e.g. case numbers, status codes, exact street addresses).
+drop_cols = [
+    'DR_NO','Date Rptd','Mocodes','Area','Rpt Dist No','Part 1-2','Premise Cd',
+    'Weapon Used Cd','Status','Status Desc','Crm Cd 1','Crm Cd 2','Crm Cd 3',
+    'Crm Cd 4','LOCATION','Cross Street'
+]
+# Drop them if present; errors='ignore' avoids a crash if a column is missing.
+df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
+
+# ---------------------------------------------------------------------------
+# 4. BUILD A PROPER DATETIME COLUMN
+# ---------------------------------------------------------------------------
+# TIME OCC is stored as a number like "930" (9:30) — pad it to always be
+# 4 digits ("0930") so hour/minute slicing below works consistently.
+df['TIME OCC'] = df['TIME OCC'].astype(str).str.zfill(4)
+
+# Combine the DATE OCC (calendar date) and TIME OCC (HHMM) into one
+# proper datetime column, slicing the first 2 digits as hour and last 2 as minute.
+df['occ_datetime'] = pd.to_datetime(
+    df['DATE OCC'].astype(str) + ' ' + df['TIME OCC'].str[:2] + ':' + df['TIME OCC'].str[2:],
+    errors='coerce'   # any unparseable date/time becomes NaT instead of raising an error
+)
+
+# Remove rows where the datetime couldn't be parsed (NaT values).
+df = df[df['occ_datetime'].notna()]
+
+# Extract the hour (0–23) and the weekday name (e.g. "Monday") for later grouping.
+df['occ_hour'] = df['occ_datetime'].dt.hour
+df['occ_weekday'] = df['occ_datetime'].dt.day_name()
+
+# Flag whether the crime happened on a weekend — useful boolean feature.
+df['is_weekend'] = df['occ_weekday'].isin(['Saturday', 'Sunday'])
+df.head()  # sanity check the new columns
+
+# ---------------------------------------------------------------------------
+# 5. TIME-OF-DAY BUCKETING
+# ---------------------------------------------------------------------------
+# Convert the raw hour into a human-readable bucket: morning/afternoon/evening/night.
+def tod_bin(h):
+    if pd.isna(h): return np.nan
+    if 5 <= h < 12: return "morning"
+    if 12 <= h < 17: return "afternoon"
+    if 17 <= h < 21: return "evening"
+    return "night"
+
+df['time_of_day'] = df['occ_hour'].apply(tod_bin)
+df['time_of_day'].value_counts()          # quick count per bucket
+df[['occ_datetime','occ_hour','time_of_day']].head()  # verify mapping looks right
+
+# ---------------------------------------------------------------------------
+# 6. EXPLORATORY PLOTS — TIME PATTERNS
+# ---------------------------------------------------------------------------
+# Bar chart: how many crimes happen in each time-of-day bucket.
+plt.figure(figsize=(8,4))
+df['time_of_day'].value_counts().plot(kind='bar')
+plt.title("Crime Count by Time of Day")
+plt.xlabel("Time of Day")
+plt.ylabel("Count")
+plt.show()
+
+# Bar chart: crime counts per weekday, forced into Mon→Sun order (otherwise
+# pandas would order them alphabetically or by frequency).
+plt.figure(figsize=(10,4))
+df['occ_weekday'].value_counts().reindex(
+    ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+).plot(kind='bar')
+plt.title("Crime Count by Day of Week")
+plt.xlabel("Day")
+plt.ylabel("Count")
+plt.show()
+
+# Line chart: crime counts by calendar month (seasonality check).
+df['month_name'] = df['occ_datetime'].dt.month_name()
+monthly_counts = df.groupby('month_name').size()
+month_order = ["January","February","March","April","May","June",
+               "July","August","September","October","November","December"]
+monthly_counts = monthly_counts.reindex(month_order)  # force calendar order
+plt.figure(figsize=(10,5))
+plt.plot(monthly_counts.index, monthly_counts.values)
+plt.title("Crime Count by Month")
+plt.xlabel("Month")
+plt.ylabel("Crime Count")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------------------------------------
+# 7. DECODE VICTIM DESCENT CODES
+# ---------------------------------------------------------------------------
+# The raw data stores victim ethnicity as single letter codes; map them to
+# readable labels for plotting/reporting.
+descent_map = {
+    'A': 'Other Asian', 'B': 'Black', 'C': 'Chinese', 'D': 'Cambodian',
+    'F': 'Filipino', 'G': 'Guamanian', 'H': 'Hispanic/Latin/Mexican',
+    'I': 'American Indian/Alaskan Native', 'J': 'Japanese', 'K': 'Korean',
+    'L': 'Laotian', 'O': 'Other', 'P': 'Pacific Islander', 'S': 'Samoan',
+    'U': 'Hawaiian', 'V': 'Vietnamese', 'W': 'White', 'X': 'Unknown',
+    'Z': 'Asian Indian'
+}
+df['Vict Descent'] = df['Vict Descent'].map(descent_map)
+
+df['time_of_day'] = df['occ_hour'].apply(tod_bin)   # recomputed (redundant, already done above)
+
+# Force victim age to numeric; any bad values become NaN instead of crashing.
+df['Vict Age'] = pd.to_numeric(df['Vict Age'], errors='coerce')
+
+# Drop rows with invalid coordinates (0,0 usually means missing GPS data,
+# not an actual location in the ocean off the coast of Africa).
+df = df[(df['LAT'] != 0) & (df['LON'] != 0)]
+
+# Bar chart of victim descent distribution.
+plt.figure(figsize=(10,5))
+df['Vict Descent'].value_counts().plot(kind='bar')
+plt.title("Victim Race Distribution")
+plt.show()
+
+# Line chart: crime volume across hours of the day.
+plt.figure(figsize=(10,5))
+df['occ_hour'].value_counts().sort_index().plot()
+plt.title("Crimes by Hour of Day")
+plt.show()
+
+# ---------------------------------------------------------------------------
+# 8. HOURLY PATTERN BROKEN DOWN BY VICTIM DESCENT
+# ---------------------------------------------------------------------------
+target = "Vict Descent"
+df[target] = df[target].fillna("UNKNOWN")   # treat missing descent as its own category
+
+# Cross-tab: count of crimes for each (hour, descent) combination.
+hourly_descent = df.groupby(['occ_hour','Vict Descent']).size().unstack(fill_value=0)
+
+# Plot one line per descent group, showing how volume changes by hour.
+plt.figure(figsize=(12,6))
+for descent in hourly_descent.columns:
+    plt.plot(hourly_descent.index, hourly_descent[descent], label=descent)
+plt.title("Crimes by Hour of Day Split by Victim Descent")
+plt.xlabel("Hour of Day")
+plt.ylabel("Number of Crimes")
+plt.xticks(range(0,24))
+plt.legend(title="Victim Descent", bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------------------------------------
+# 9. CLASSIFICATION MODEL — PREDICT VICTIM DESCENT
+# ---------------------------------------------------------------------------
+# Choose numeric and categorical predictor columns, keeping only ones that
+# actually exist in the dataframe (defensive coding in case columns were dropped).
+numerical = ['occ_hour','Vict Age','LAT','LON']
+numerical = [c for c in numerical if c in df.columns]
+
+Categorical = [
+    'AREA NAME','Premis Desc','Crm Cd Desc',
+    'Weapon Desc','occ_weekday','time_of_day'
+]
+categorical = [c for c in Categorical if c in df.columns]
+
+X = df[numerical + categorical]   # feature matrix
+y = df[target]                    # label to predict (victim descent)
+
+# Split into training (75%) and test (25%) sets, preserving class proportions
+# via stratify=y (important since some descent categories are rare).
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, stratify=y, test_size=0.25, random_state=42
+)
+
+# SMOTE (used below) needs k_neighbors <= (smallest class size - 1), so
+# figure out a safe value automatically to avoid a runtime error.
+min_class = y_train.value_counts().min()
+k = max(1, min(5, min_class - 1))
+print("Using k_neighbors =", k)
+
+# Preprocessing: scale numeric columns, one-hot encode categorical columns.
+# handle_unknown='ignore' means any category seen only at test time won't crash the pipeline.
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), numerical),
+        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical)
+    ]
+)
+
+# Full pipeline: preprocess -> oversample minority classes with SMOTE -> train RandomForest.
+# Using imblearn's Pipeline (not sklearn's) so SMOTE only resamples the
+# training folds, never the test/validation data — avoiding data leakage.
+pipeline = ImbPipeline([
+    ('prep', preprocessor),
+    ('smote', SMOTE(k_neighbors=k)),
+    ('model', RandomForestClassifier(
+        n_estimators=50,   # fewer trees = faster, at some cost to accuracy
+        max_depth=10,      # limits overfitting and memory use
+        n_jobs=1,           # single core, to control memory/CPU usage
+        random_state=42     # reproducible results
+    ))
+])
+pipeline.fit(X_train, y_train)          # train on the training split
+y_pred = pipeline.predict(X_test)       # predict on unseen test split
+
+# Print precision/recall/F1 per class.
+from sklearn.metrics import classification_report, confusion_matrix
+print("Classification Report:\n")
+print(classification_report(y_test, y_pred))
+
+# Visualize the confusion matrix as a heatmap (rows = true class, cols = predicted).
+cm = confusion_matrix(y_test, y_pred, labels=pipeline.classes_)
+plt.figure(figsize=(10,8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=pipeline.classes_, yticklabels=pipeline.classes_)
+plt.title("Confusion Matrix")
+plt.show()
+
+# ---------------------------------------------------------------------------
+# 10. MAPPING CRIME LOCATIONS WITH FOLIUM (first pass — simple sample)
+# ---------------------------------------------------------------------------
+!pip install folium   # interactive Leaflet.js maps in Python
+
+import folium
+
+# Create a map centered on the average lat/lon of the dataset (roughly LA center).
+crime_map = folium.Map(location=[df['LAT'].mean(), df['LON'].mean()], zoom_start=10)
+
+# Plot a random sample of 200 points as small circle markers (plotting all
+# rows would be slow and visually overwhelming).
+for idx, row in df.sample(200).iterrows():
+    folium.CircleMarker(
+        location=[row['LAT'], row['LON']],
+        radius=2
+    ).add_to(crime_map)
+
+# Example color mapping for two crime types (not fully used yet — placeholder
+# for the more complete color-mapped version built next).
+color_map = {'Assault': 'red', 'Theft': 'blue'}
+
+# NOTE: this uses the leftover `row` variable from the loop above (last row
+# only) — not a real per-point popup. Left in as-is from the original script.
+folium.CircleMarker(
+    location=[row['LAT'], row['LON']],
+    radius=2,
+    popup=f"{row['Crm Cd Desc']} at {row['DATE OCC']}"
+).add_to(crime_map)
+
+# MarkerCluster groups nearby points together and expands them on zoom —
+# improves performance/readability for large point counts.
+from folium.plugins import MarkerCluster
+marker_cluster = MarkerCluster().add_to(crime_map)
+
+crime_map   # display the map (only works in a notebook)
+
+# ---------------------------------------------------------------------------
+# 11. MAPPING — FULL DATASET, COLOR-CODED BY CRIME TYPE
+# ---------------------------------------------------------------------------
+import folium
+from folium.plugins import MarkerCluster
+
+# Identify the 10 most frequent crime types to assign distinct colors to.
+top_crimes = df['Crm Cd Desc'].value_counts().head(10).index.tolist()
+colors = ['red','blue','green','purple','orange','darkred','cadetblue','darkgreen','pink','darkpurple']
+crime_color_map = {crime: colors[i] for i, crime in enumerate(top_crimes)}
+crime_color_map_default = 'gray'   # anything outside the top 10 gets gray
+
+crime_map = folium.Map(location=[df['LAT'].mean(), df['LON'].mean()], zoom_start=10)
+marker_cluster = MarkerCluster().add_to(crime_map)
+
+# Loop over EVERY row (can be slow for 100k rows) and plot a colored marker
+# per crime, with a popup showing the crime type and date.
+for idx, row in df.iterrows():
+    crime_type = row['Crm Cd Desc']
+    color = crime_color_map.get(crime_type, crime_color_map_default)
+    folium.CircleMarker(
+        location=[row['LAT'], row['LON']],
+        radius=2,
+        color=color,
+        fill=True,
+        fill_opacity=0.6,
+        popup=f"{crime_type} at {row['DATE OCC']}"
+    ).add_to(marker_cluster)
+
+crime_map
+
+df['Crm Cd Desc'].value_counts().head(15)   # top 15 most common crime types overall
+
+# ---------------------------------------------------------------------------
+# 12. DECODE VICTIM SEX AND EXPLORE GENDER DISTRIBUTION
+# ---------------------------------------------------------------------------
+gender_map = {
+    'F': 'Female',
+    'M': 'Male',
+    'X': 'Unknown',
+    'H': 'Other'
+}
+df['Vict Sex'] = df['Vict Sex'].map(gender_map)
+df['Vict Sex'].value_counts().plot(kind='bar', rot=0)
+print(df['Vict Sex'].unique())
+print(df['Vict Sex'].value_counts())
+
+# Strip whitespace, then check how many values are still missing.
+df['Vict Sex'] = df['Vict Sex'].str.strip()
+df['Vict Sex'].isna().sum()
+
+# NOTE: the block below re-reads the raw CSV just to restore the original
+# 'Vict Sex' column (since it was already overwritten above with mapped
+# labels, re-mapping it again would produce NaNs). This is inefficient but
+# kept as-is from the original script — in a cleaner rewrite you'd just
+# keep the raw column under a different name from the start.
+gender_map = {
+    'F': 'Female',
+    'M': 'Male',
+    'X': 'Unknown',
+    'H': 'Other'
+}
+df['Vict Sex'] = pd.read_csv(path, low_memory=False, nrows=100000)['Vict Sex']
+df['Vict Sex'] = df['Vict Sex'].str.strip()
+df['Vict Sex'] = df['Vict Sex'].map(gender_map).fillna('Unknown')
+
+plt.figure(figsize=(6,4))
+df['Vict Sex'].value_counts().plot(kind='bar')
+plt.title("Victim Gender Distribution")
+plt.xlabel("Gender")
+plt.ylabel("Count")
+plt.tight_layout()
+plt.show()
+
+# Reload + re-clean the raw gender column again (duplicate of the block
+# above — redundant but harmless; left in as originally written).
+df['Vict Sex'] = pd.read_csv(path, low_memory=False, nrows=100000)['Vict Sex']
+df['Vict Sex'] = df['Vict Sex'].astype(str).str.strip()
+gender_map = {
+    'F': 'Female',
+    'M': 'Male',
+    'X': 'Unknown',
+    'H': 'Other'
+}
+df['Vict Sex'] = df['Vict Sex'].map(gender_map).fillna('Unknown')
+print(df['Vict Sex'].value_counts())
+
+# Cross-tab of time-of-day vs gender, then a stacked bar chart to see how
+# gender proportions shift across the day.
+gender_time = df.groupby(['time_of_day', 'Vict Sex']).size().unstack(fill_value=0)
+gender_time.loc[['morning','afternoon','evening','night']].plot(
+    kind='bar',
+    stacked=True,
+    figsize=(8,5)
+)
+plt.title("Victim Gender Distribution by Time of Day")
+plt.xlabel("Time of Day")
+plt.ylabel("Number of Crimes")
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------------------------------------
+# 13. CLUSTERING — GEOGRAPHY + HOUR + AGE
+# ---------------------------------------------------------------------------
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+
+# Cluster on 4 numeric features: location, time of day (hour), and victim age.
+cluster_features = ['LAT', 'LON', 'occ_hour', 'Vict Age']
+df_cluster = df[cluster_features].dropna()   # KMeans can't handle NaNs
+
+# Scale all features to comparable ranges — otherwise LAT/LON (small ranges)
+# vs hour (0-23) vs age (0-100) would dominate the distance calculation unevenly.
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(df_cluster)
+
+# Partition into 5 clusters based on scaled features.
+kmeans = KMeans(n_clusters=5, random_state=42)
+df_cluster['cluster'] = kmeans.fit_predict(X_scaled)
+
+import folium
+from folium.plugins import MarkerCluster
+
+cluster_map = folium.Map(location=[df['LAT'].mean(), df['LON'].mean()], zoom_start=10)
+marker_cluster = MarkerCluster().add_to(cluster_map)
+colors = ['red','blue','green','purple','orange']   # one color per cluster (0-4)
+
+# Sample 500 points for plotting speed, color-coded by cluster assignment.
+for idx, row in df_cluster.sample(500).iterrows():
+    cluster_idx = int(row['cluster'])   # ensure integer for list indexing
+    folium.CircleMarker(
+        location=[row['LAT'], row['LON']],
+        radius=3,
+        color=colors[cluster_idx],
+        fill=True,
+        fill_opacity=0.6
+    ).add_to(marker_cluster)
+
+cluster_map
+
+# ---------------------------------------------------------------------------
+# 14. CLUSTERING — VICTIM DESCENT + SEX ONLY (categorical clustering)
+# ---------------------------------------------------------------------------
+cluster_features = ['Vict Descent', 'Vict Sex']
+df_cluster = df[cluster_features].dropna()
+
+from sklearn.preprocessing import OneHotEncoder
+# One-hot encode the two categorical columns; drop='first' avoids
+# redundant/collinear columns (e.g. dropping "Male" since "not Female,
+# not Unknown, not Other" already implies Male).
+ohe = OneHotEncoder(sparse_output=False, drop='first')
+X_encoded = ohe.fit_transform(df_cluster)
+
+from sklearn.cluster import KMeans
+kmeans = KMeans(n_clusters=5, random_state=42)
+df_cluster['cluster'] = kmeans.fit_predict(X_encoded)
+
+df_cluster['cluster'].value_counts()   # how many records fall in each cluster
+
+# Print the actual (descent, sex) combinations that make up each cluster —
+# helps interpret what each cluster "means".
+for i in range(5):
+    print(f"\nCluster {i} composition:")
+    print(df_cluster[df_cluster['cluster']==i][['Vict Descent','Vict Sex']].value_counts())
+
+# Reduce the one-hot encoded features to 2 dimensions with PCA purely for
+# visualization purposes (can't plot high-dimensional data directly).
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_encoded)
+plt.scatter(X_pca[:,0], X_pca[:,1], c=df_cluster['cluster'], cmap='tab10', alpha=0.6)
+plt.title("Clusters based on Victim Race and Gender")
+plt.show()
+
+# ---------------------------------------------------------------------------
+# 15. CLUSTERING — RICHER FEATURE SET (age, sex, descent, time, location)
+# ---------------------------------------------------------------------------
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.cluster import KMeans
+import numpy as np
+import pandas as pd
+import folium
+from folium.plugins import MarkerCluster
+
+cluster_features = ['Vict Age', 'Vict Sex', 'Vict Descent', 'time_of_day', 'LAT', 'LON']
+df_cluster = df[cluster_features].dropna()
+
+numerical_features = ['Vict Age', 'LAT', 'LON']
+categorical_features = ['Vict Sex', 'Vict Descent', 'time_of_day']
+
+# Encode categorical columns separately from numeric ones, since they need
+# different treatment (one-hot vs scaling).
+ohe = OneHotEncoder(sparse_output=False, drop='first')
+X_cat = ohe.fit_transform(df_cluster[categorical_features])
+
+scaler = StandardScaler()
+X_num = scaler.fit_transform(df_cluster[numerical_features])
+
+# Concatenate numeric + encoded categorical into one feature matrix.
+X_final = np.hstack([X_num, X_cat])
+
+k = 5   # number of clusters — arbitrary starting choice, tune with e.g. elbow method
+kmeans = KMeans(n_clusters=k, random_state=42)
+df_cluster['cluster'] = kmeans.fit_predict(X_final)
+
+cluster_map = folium.Map(location=[df['LAT'].mean(), df['LON'].mean()], zoom_start=10)
+marker_cluster = MarkerCluster().add_to(cluster_map)
+colors = ['red','blue','green','purple','orange']
+
+# Sample 500 points, color by cluster, and add a rich popup describing the
+# record's age/gender/race/time-of-day.
+for idx, row in df_cluster.sample(500).iterrows():
+    folium.CircleMarker(
+        location=[row['LAT'], row['LON']],
+        radius=3,
+        color=colors[row['cluster']],
+        fill=True,
+        fill_opacity=0.6,
+        popup=f"Age: {row['Vict Age']}, Gender: {row['Vict Sex']}, Race: {row['Vict Descent']}, Time: {row['time_of_day']}"
+    ).add_to(marker_cluster)
+
+cluster_map
+
+# ---------------------------------------------------------------------------
+# 16. SUMMARIZE EACH CLUSTER'S CHARACTERISTICS
+# ---------------------------------------------------------------------------
+# Helper: safely get the most frequent value in a Series (mode), or NaN if empty.
+def get_mode(series):
+    return series.mode()[0] if not series.mode().empty else np.nan
+
+# For each cluster: how many records, average victim age, and the most
+# common gender/race/time-of-day — a compact "profile" of each cluster.
+cluster_stats = df_cluster.groupby('cluster').agg(
+    Count=('Vict Age', 'count'),
+    Avg_Age=('Vict Age', 'mean'),
+    Dominant_Gender=('Vict Sex', get_mode),
+    Dominant_Race=('Vict Descent', get_mode),
+    Peak_Time=('time_of_day', get_mode)
+).reset_index()
+
+cluster_stats   # display the profile table
+
+# ---------------------------------------------------------------------------
+# 17. MAP WITH A LEGEND
+# ---------------------------------------------------------------------------
+cluster_map = folium.Map(location=[df['LAT'].mean(), df['LON'].mean()], zoom_start=10)
+marker_cluster = MarkerCluster().add_to(cluster_map)
+colors = ['red','blue','green','purple','orange']
+labels = [f'Cluster {i}' for i in range(len(colors))]   # generic placeholder labels
+
+for idx, row in df_cluster.sample(500).iterrows():
+    folium.CircleMarker(
+        location=[row['LAT'], row['LON']],
+        radius=3,
+        color=colors[row['cluster']],
+        fill=True,
+        fill_opacity=0.6,
+        popup=f"Age: {row['Vict Age']}, Gender: {row['Vict Sex']}, Race: {row['Vict Descent']}, Time: {row['time_of_day']}"
+    ).add_to(marker_cluster)
+
+# Build a small HTML box with colored swatches + labels, positioned in the
+# bottom-left corner of the map, and inject it directly into the map's HTML.
+legend_html = '''
+<div style="
+position: fixed; 
+bottom: 50px; left: 50px; width: 120px; height: 140px; 
+background-color: white; border:2px solid grey; z-index:9999; 
+font-size:14px; padding: 10px;
+">
+<b>Cluster Legend</b><br>
+'''
+for color, label in zip(colors, labels):
+    legend_html += f'<i style="background:{color};width:10px;height:10px;display:inline-block;margin-right:5px;"></i>{label}<br>'
+legend_html += '</div>'
+
+cluster_map.get_root().html.add_child(folium.Element(legend_html))
+cluster_map
+
+# ---------------------------------------------------------------------------
+# 18. MAP WITH MEANINGFUL (DESCRIPTIVE) LEGEND LABELS
+# ---------------------------------------------------------------------------
+# Instead of "Cluster 0", "Cluster 1"... build human-readable labels using
+# the cluster_stats profile computed earlier (e.g. "Male, White, Avg Age: 34, Peak: night").
+cluster_labels = {}
+for idx, row in cluster_stats.iterrows():
+    cluster_labels[row['cluster']] = (
+        f"{row['Dominant_Gender']}, {row['Dominant_Race']}, "
+        f"Avg Age: {int(row['Avg_Age'])}, Peak: {row['Peak_Time']}"
+    )
+
+cluster_map = folium.Map(location=[df['LAT'].mean(), df['LON'].mean()], zoom_start=10)
+marker_cluster = MarkerCluster().add_to(cluster_map)
+colors = ['red','blue','green','purple','orange']
+
+for idx, row in df_cluster.sample(500).iterrows():
+    folium.CircleMarker(
+        location=[row['LAT'], row['LON']],
+        radius=3,
+        color=colors[row['cluster']],
+        fill=True,
+        fill_opacity=0.6,
+        popup=f"Age: {row['Vict Age']}, Gender: {row['Vict Sex']}, Race: {row['Vict Descent']}, Time: {row['time_of_day']}"
+    ).add_to(marker_cluster)
+
+legend_html = '''
+<div style="
+position: fixed; 
+bottom: 50px; left: 50px; width: 250px; height: auto; 
+background-color: white; border:2px solid grey; z-index:9999; 
+font-size:12px; padding: 10px;
+">
+<b>Cluster Legend</b><br>
+'''
+for color, cluster_num in zip(colors, range(len(colors))):
+    label = cluster_labels.get(cluster_num, f'Cluster {cluster_num}')
+    legend_html += f'<i style="background:{color};width:10px;height:10px;display:inline-block;margin-right:5px;"></i>{label}<br>'
+legend_html += '</div>'
+
+cluster_map.get_root().html.add_child(folium.Element(legend_html))
+cluster_map
+
+# ---------------------------------------------------------------------------
+# 19. TABULAR CLUSTER SUMMARIES (pivot tables)
+# ---------------------------------------------------------------------------
+df_cluster['cluster'].value_counts().sort_index()   # record count per cluster, in cluster-number order
+
+# Same profile as before, using .mode()[0] directly instead of the get_mode() helper.
+cluster_summary = df_cluster.groupby('cluster').agg(
+    Count=('Vict Age', 'count'),
+    Avg_Age=('Vict Age', 'mean'),
+    Dominant_Gender=('Vict Sex', lambda x: x.mode()[0]),
+    Dominant_Race=('Vict Descent', lambda x: x.mode()[0]),
+    Peak_Time=('time_of_day', lambda x: x.mode()[0])
+).reset_index()
+cluster_summary
+
+# Build a leaner summary (just count + avg age)...
+cluster_summary = df_cluster.groupby('cluster').agg(
+    Total_Crimes=('Vict Age', 'count'),
+    Avg_Age=('Vict Age', 'mean')
+)
+# ...then separately pivot to get a full breakdown of counts by gender per cluster...
+cluster_gender = pd.pivot_table(
+    df_cluster, index='cluster', columns='Vict Sex',
+    values='Vict Age', aggfunc='count', fill_value=0
+)
+# ...by race per cluster...
+cluster_race = pd.pivot_table(
+    df_cluster, index='cluster', columns='Vict Descent',
+    values='Vict Age', aggfunc='count', fill_value=0
+)
+# ...and by time-of-day per cluster.
+cluster_time = pd.pivot_table(
+    df_cluster, index='cluster', columns='time_of_day',
+    values='Vict Age', aggfunc='count', fill_value=0
+)
+
+# Combine all four summaries side-by-side into one wide table.
+full_summary = pd.concat([cluster_summary, cluster_gender, cluster_race, cluster_time], axis=1)
+full_summary
+
+# ---------------------------------------------------------------------------
+# 20. CLUSTERING — ADD CRIME TYPE, AREA, PREMISE, AND WEAPON (bigger feature set)
+# ---------------------------------------------------------------------------
+cluster_features = ['Vict Age', 'Vict Sex', 'Vict Descent', 'time_of_day',
+                    'LAT', 'LON', 'occ_hour', 'AREA NAME', 'Crm Cd Desc', 
+                    'Premis Desc', 'Weapon Desc']
+
+df_cluster = df[cluster_features].dropna()
+numerical_features = ['Vict Age', 'LAT', 'LON', 'occ_hour']
+categorical_features = ['Vict Sex', 'Vict Descent', 'time_of_day', 
+                        'AREA NAME', 'Crm Cd Desc', 'Premis Desc', 'Weapon Desc']
+
+from sklearn.preprocessing import OneHotEncoder
+ohe = OneHotEncoder(sparse_output=False, drop='first')
+X_cat = ohe.fit_transform(df_cluster[categorical_features])
+
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler()
+X_num = scaler.fit_transform(df_cluster[numerical_features])
+
+import numpy as np
+X_final = np.hstack([X_num, X_cat])
+
+from sklearn.cluster import KMeans
+k = 5
+kmeans = KMeans(n_clusters=k, random_state=42)
+df_cluster['cluster'] = kmeans.fit_predict(X_final)
+
+# Profile clusters, now also including peak HOUR (not just time-of-day bucket).
+df_cluster.groupby('cluster').agg(
+    Total_Crimes=('Vict Age', 'count'),
+    Avg_Age=('Vict Age', 'mean'),
+    Dominant_Gender=('Vict Sex', lambda x: x.mode()[0]),
+    Dominant_Race=('Vict Descent', lambda x: x.mode()[0]),
+    Peak_Hour=('occ_hour', lambda x: x.mode()[0])
+).reset_index()
+
+# --- The exact same clustering block is repeated once more below (as in the
+# original script) — kept for fidelity, but in practice you'd only run it once. ---
+cluster_features = ['Vict Age', 'Vict Sex', 'Vict Descent', 'time_of_day',
+                    'LAT', 'LON', 'occ_hour', 'AREA NAME', 'Crm Cd Desc', 
+                    'Premis Desc', 'Weapon Desc']
+df_cluster = df[cluster_features].dropna()
+numerical_features = ['Vict Age', 'LAT', 'LON', 'occ_hour']
+categorical_features = ['Vict Sex', 'Vict Descent', 'time_of_day', 
+                        'AREA NAME', 'Crm Cd Desc', 'Premis Desc', 'Weapon Desc']
+from sklearn.preprocessing import OneHotEncoder
+ohe = OneHotEncoder(sparse_output=False, drop='first')
+X_cat = ohe.fit_transform(df_cluster[categorical_features])
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler()
+X_num = scaler.fit_transform(df_cluster[numerical_features])
+import numpy as np
+X_final = np.hstack([X_num, X_cat])
+from sklearn.cluster import KMeans
+k = 5
+kmeans = KMeans(n_clusters=k, random_state=42)
+df_cluster['cluster'] = kmeans.fit_predict(X_final)
+
+cluster_stats = df_cluster.groupby('cluster').agg(
+    Total_Crimes=('Vict Age', 'count'),
+    Avg_Age=('Vict Age', 'mean'),
+    Dominant_Gender=('Vict Sex', lambda x: x.mode()[0]),
+    Dominant_Race=('Vict Descent', lambda x: x.mode()[0]),
+    Peak_Time=('time_of_day', lambda x: x.mode()[0])
+).reset_index()
+
+cluster_labels = {}
+for idx, row in cluster_stats.iterrows():
+    cluster_labels[row['cluster']] = (
+        f"{row['Dominant_Gender']}, {row['Dominant_Race']}, "
+        f"Avg Age: {int(row['Avg_Age'])}, Peak: {row['Peak_Time']}"
+    )
+
+import folium
+from folium.plugins import MarkerCluster
+cluster_map = folium.Map(location=[df['LAT'].mean(), df['LON'].mean()], zoom_start=10)
+marker_cluster = MarkerCluster().add_to(cluster_map)
+colors = ['red','blue','green','purple','orange']
+
+for idx, row in df_cluster.sample(500).iterrows():
+    folium.CircleMarker(
+        location=[row['LAT'], row['LON']],
+        radius=3,
+        color=colors[row['cluster']],
+        fill=True,
+        fill_opacity=0.6,
+        popup=f"Age: {row['Vict Age']}, Gender: {row['Vict Sex']}, Race: {row['Vict Descent']}, Time: {row['time_of_day']}, Cluster: {cluster_labels[row['cluster']]}"
+    ).add_to(marker_cluster)
+
+legend_html = '''
+<div style="
+position: fixed; 
+bottom: 50px; left: 50px; width: 250px; height: auto; 
+background-color: white; border:2px solid grey; z-index:9999; 
+font-size:12px; padding: 10px;
+">
+<b>Cluster Legend</b><br>
+'''
+for color, cluster_num in zip(colors, range(len(colors))):
+    label = cluster_labels.get(cluster_num, f'Cluster {cluster_num}')
+    legend_html += f'<i style="background:{color};width:10px;height:10px;display:inline-block;margin-right:5px;"></i>{label}<br>'
+legend_html += '</div>'
+
+cluster_map.get_root().html.add_child(folium.Element(legend_html))
+cluster_map
+
+# ---------------------------------------------------------------------------
+# 21. CLUSTERING WITH Birch INSTEAD OF KMeans (alternative algorithm)
+# ---------------------------------------------------------------------------
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+import numpy as np
+
+cluster_features = ['Vict Age', 'Vict Sex', 'Vict Descent', 'time_of_day',
+                    'LAT', 'LON', 'occ_hour', 'AREA NAME', 'Crm Cd Desc', 
+                    'Premis Desc', 'Weapon Desc']
+df_cluster = df[cluster_features].dropna()
+
+numerical_features = ['Vict Age', 'LAT', 'LON', 'occ_hour']
+categorical_features = ['Vict Sex', 'Vict Descent', 'time_of_day',
+                        'AREA NAME', 'Crm Cd Desc', 'Premis Desc', 'Weapon Desc']
+
+ohe = OneHotEncoder(sparse_output=False, drop='first')
+X_cat = ohe.fit_transform(df_cluster[categorical_features])
+scaler = StandardScaler()
+X_num = scaler.fit_transform(df_cluster[numerical_features])
+X_final = np.hstack([X_num, X_cat])
+
+# Birch is a hierarchical clustering method that scales well to large
+# datasets — used here as an alternative to KMeans, with 4 target clusters.
+from sklearn.cluster import Birch
+k = 4
+birch = Birch(n_clusters=k)
+df_cluster['cluster'] = birch.fit_predict(X_final)
+
+cluster_stats = df_cluster.groupby('cluster').agg(
+    Total_Crimes=('Vict Age', 'count'),
+    Avg_Age=('Vict Age', 'mean'),
+    Dominant_Gender=('Vict Sex', lambda x: x.mode()[0]),
+    Dominant_Race=('Vict Descent', lambda x: x.mode()[0]),
+    Peak_Time=('time_of_day', lambda x: x.mode()[0])
+).reset_index()
+
+cluster_labels = {}
+for idx, row in cluster_stats.iterrows():
+    cluster_labels[row['cluster']] = (
+        f"{row['Dominant_Gender']}, {row['Dominant_Race']}, "
+        f"Avg Age: {int(row['Avg_Age'])}, Peak: {row['Peak_Time']}"
+    )
+
+import folium
+from folium.plugins import MarkerCluster
+cluster_map = folium.Map(location=[df['LAT'].mean(), df['LON'].mean()], zoom_start=10)
+marker_cluster = MarkerCluster().add_to(cluster_map)
+colors = ['red','blue','green','purple']   # only 4 colors needed (k=4)
+
+for idx, row in df_cluster.sample(500).iterrows():
+    folium.CircleMarker(
+        location=[row['LAT'], row['LON']],
+        radius=3,
+        color=colors[row['cluster']],
+        fill=True,
+        fill_opacity=0.6,
+        popup=f"Age: {row['Vict Age']}, Gender: {row['Vict Sex']}, Race: {row['Vict Descent']}, Time: {row['time_of_day']}, Cluster: {cluster_labels[row['cluster']]}"
+    ).add_to(marker_cluster)
+
+legend_html = '''
+<div style="
+position: fixed; 
+bottom: 50px; left: 50px; width: 250px; height: auto; 
+background-color: white; border:2px solid grey; z-index:9999; 
+font-size:12px; padding: 10px;
+">
+<b>Cluster Legend</b><br>
+'''
+for color, cluster_num in zip(colors, range(k)):
+    label = cluster_labels.get(cluster_num, f'Cluster {cluster_num}')
+    legend_html += f'<i style="background:{color};width:10px;height:10px;display:inline-block;margin-right:5px;"></i>{label}<br>'
+legend_html += '</div>'
+
+cluster_map.get_root().html.add_child(folium.Element(legend_html))
+cluster_map
+
+# ---------------------------------------------------------------------------
+# 22. ASSOCIATION RULE MINING (apriori)
+# ---------------------------------------------------------------------------
+# Goal: find combinations of attributes that co-occur more often than chance
+# would suggest — e.g. "Weapon = Handgun" tends to co-occur with "Premise = Street".
+from mlxtend.frequent_patterns import apriori, association_rules
+
+assoc_features = ['Crm Cd Desc', 'Vict Sex', 'Vict Descent', 'time_of_day', 'Weapon Desc', 'Premis Desc']
+df_assoc = df[assoc_features].dropna()
+
+# One-hot encode every category value into its own True/False column —
+# apriori needs a "basket" format where each column is a binary item.
+df_onehot = pd.get_dummies(df_assoc)
+
+# Find itemsets (combinations of True columns) that appear in at least 1%
+# of rows (min_support=0.01) — filters out extremely rare combinations.
+frequent_itemsets = apriori(df_onehot, min_support=0.01, use_colnames=True)
+
+# From those itemsets, derive "if A then B" rules, keeping only rules with
+# lift >= 1.2 (i.e. A and B co-occur at least 20% more than if independent).
+rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1.2)
+rules = rules.sort_values(by='lift', ascending=False)   # strongest associations first
+rules[['antecedents', 'consequents', 'support', 'confidence', 'lift']].head(20)
+
+# Display settings so full rule tables aren't truncated in the notebook output.
+pd.set_option('display.max_rows', None)
+pd.set_option('display.max_colwidth', None)
+
+rules_display = rules[['antecedents', 'consequents', 'support', 'confidence', 'lift']]
+rules_display
+
+# ---------------------------------------------------------------------------
+# 23. DBSCAN CLUSTERING (density-based, finds irregularly-shaped clusters)
+# ---------------------------------------------------------------------------
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import DBSCAN
+import pandas as pd
+import numpy as np
+
+features = ['LAT','LON','Vict Age','occ_hour']
+df_cluster = df[features + ['Vict Sex','Vict Descent']].dropna()
+
+# One-hot encode gender/race directly with pandas (simpler alternative to OneHotEncoder here).
+df_cluster = pd.get_dummies(df_cluster, columns=['Vict Sex','Vict Descent'])
+
+# Scale all numeric + one-hot columns together before feeding into DBSCAN,
+# since DBSCAN relies on distance (eps) which is sensitive to feature scale.
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(df_cluster[features + 
+                     [c for c in df_cluster.columns if c.startswith("Vict")]])
+
+# DBSCAN groups points that are densely packed together; points in
+# low-density regions are labeled -1 ("noise", i.e. not part of any cluster).
+# eps = neighborhood radius, min_samples = minimum points to form a dense region.
+dbscan = DBSCAN(eps=0.35, min_samples=50)
+df_cluster['cluster'] = dbscan.fit_predict(X_scaled)
+df_cluster['cluster'].value_counts()   # cluster sizes, including -1 for noise points
